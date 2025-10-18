@@ -120,9 +120,26 @@ def detect_faces(image_path: str, output_path: str | None = None) -> int:
                 continue
             accepted.append((x, y, w, h))
 
+    # pick a palette of distinct colors
+    palette = [
+        (0, 255, 0),
+        (0, 128, 255),
+        (255, 0, 0),
+        (255, 255, 0),
+        (255, 0, 255),
+        (0, 255, 255),
+        (128, 0, 128),
+        (0, 128, 0),
+    ]
+
     for i, (x, y, w, h) in enumerate(accepted, start=1):
-        cv2.rectangle(img, (x, y), (x + w, y + h), (0, 255, 0), 3)
-        cv2.putText(img, f"Person {i}", (x, y - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+        color = palette[(i - 1) % len(palette)]
+        cv2.rectangle(img, (x, y), (x + w, y + h), color, 3)
+        # draw filled label background for readability
+        label = f"Person {i}"
+        (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2)
+        cv2.rectangle(img, (x, y - th - 12), (x + tw + 6, y), color, -1)
+        cv2.putText(img, label, (x + 3, y - 6), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 0), 2)
 
     # Show the image with all detected faces at once
     cv2.imshow('face detection', img)
