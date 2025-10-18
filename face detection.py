@@ -1,5 +1,7 @@
 import cv2
 import sys
+import tkinter as tk
+from tkinter import filedialog, messagebox
 
 
 def detect_faces(image_path: str, output_path: str | None = None) -> int:
@@ -7,7 +9,7 @@ def detect_faces(image_path: str, output_path: str | None = None) -> int:
 
     Returns the number of faces detected.
     """
-    # use multiple cascades to improve recall (frontal, alt2, profile)
+    
     face_cascade1 = cv2.CascadeClassifier(
         cv2.data.haarcascades + 'haarcascade_frontalface_default.xml'
     )
@@ -15,9 +17,9 @@ def detect_faces(image_path: str, output_path: str | None = None) -> int:
         cv2.data.haarcascades + 'haarcascade_frontalface_alt2.xml'
     )
     profile_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_profileface.xml')
-    # use eye cascade as a verification step so we primarily keep human faces
+    
     eye_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_eye.xml')
-    # fallback cascade that works better with eyeglasses/sunglasses
+    
     eye_glasses_cascade = cv2.CascadeClassifier(
         cv2.data.haarcascades + 'haarcascade_eye_tree_eyeglasses.xml'
     )
@@ -27,14 +29,15 @@ def detect_faces(image_path: str, output_path: str | None = None) -> int:
         print(f"Error: couldn't read image at '{image_path}'")
         return 0
 
-    # convert to gray and improve contrast to help detection in varied lighting
+    
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     gray = cv2.equalizeHist(gray)
 
     # tune parameters for better multiple-face detection
-    faces1 = face_cascade1.detectMultiScale(gray, scaleFactor=1.05, minNeighbors=4, minSize=(30, 30))
-    faces2 = face_cascade2.detectMultiScale(gray, scaleFactor=1.05, minNeighbors=4, minSize=(30, 30))
-    profiles = profile_cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=3, minSize=(30, 30))
+    # relax parameters a bit to increase recall (catch sunglasses/profile faces)
+    faces1 = face_cascade1.detectMultiScale(gray, scaleFactor=1.05, minNeighbors=3, minSize=(20, 20))
+    faces2 = face_cascade2.detectMultiScale(gray, scaleFactor=1.05, minNeighbors=3, minSize=(20, 20))
+    profiles = profile_cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=3, minSize=(20, 20))
     # profile cascade detects faces looking to one side only; run on flipped image too
     gray_flipped = cv2.flip(gray, 1)
     profiles_flipped = profile_cascade.detectMultiScale(gray_flipped, scaleFactor=1.1, minNeighbors=3, minSize=(30, 30))
@@ -93,13 +96,17 @@ def detect_faces(image_path: str, output_path: str | None = None) -> int:
 
     merged = nms(all_candidates, iou_threshold=0.35)
 
+    # debug: show candidate counts
+    print(f"Candidates -> frontal1: {len(faces1)}, frontal2: {len(faces2)}, profiles: {len(profiles)}, merged: {len(merged)}")
+
     accepted = []
     for (x, y, w, h, src) in merged:
         # simple aspect ratio/size checks to avoid long thin objects (ties, hands)
         aspect = w / float(h) if h > 0 else 0
-        if w < 30 or h < 30:
+        if w < 20 or h < 20:
             continue
-        if aspect < 0.4 or aspect > 1.6:
+        # allow a wider aspect ratio so slightly rotated/partial faces still pass
+        if aspect < 0.3 or aspect > 2.0:
             continue
 
         # verify by checking for eyes inside the face ROI
@@ -115,9 +122,47 @@ def detect_faces(image_path: str, output_path: str | None = None) -> int:
                 accepted.append((x, y, w, h))
                 continue
         else:
-            # frontal detection: require at least one eye
+            # frontal detection: try to require at least one eye
             if len(eyes) == 0:
+                # if no eyes found, accept if this frontal box overlaps any profile candidate
+                def iou_box(a, b):
+                    ax1, ay1, aw, ah = a
+                    bx1, by1, bw, bh = b
+                    ax2 = ax1 + aw
+                    ay2 = ay1 + ah
+                    bx2 = bx1 + bw
+                    by2 = by1 + bh
+                    ix1 = max(ax1, bx1)
+                    iy1 = max(ay1, by1)
+                    ix2 = min(ax2, bx2)
+                    iy2 = min(ay2, by2)
+                    iw = max(0, ix2 - ix1)
+                    ih = max(0, iy2 - iy1)
+                    inter = iw * ih
+                    areaa = aw * ah
+                    areab = bw * bh
+                    denom = float(areaa + areab - inter + 1e-6)
+                    return inter / denom
+
+                overlaps_profile = False
+                for (xx, yy, ww, hh, src2) in merged:
+                    if src2 == 'profile':
+                        if iou_box((x, y, w, h), (xx, yy, ww, hh)) > 0.15:
+                            overlaps_profile = True
+                            break
+                if overlaps_profile:
+                    accepted.append((x, y, w, h))
+                    continue
+                # otherwise skip this frontal candidate
                 continue
+            accepted.append((x, y, w, h))
+
+    # If nothing passed the filters, print debug info and try a relaxed fallback
+    if len(merged) == 0:
+        print('No merged candidates found from cascades. Trying relaxed detection...')
+        relaxed = list(face_cascade1.detectMultiScale(gray, scaleFactor=1.03, minNeighbors=2, minSize=(10, 10)))
+        print(f'Relaxed frontal candidates: {len(relaxed)}')
+        for (x, y, w, h) in relaxed:
             accepted.append((x, y, w, h))
 
     # pick a palette of distinct colors
@@ -156,13 +201,32 @@ def detect_faces(image_path: str, output_path: str | None = None) -> int:
 
 
 if __name__ == '__main__':
-    # allow user to pass image path and optional output path
-    img_path = 'image5.jpeg'
+    # If no CLI args, show a file picker GUI to choose image
+    img_path = None
     out_path = None
     if len(sys.argv) >= 2:
         img_path = sys.argv[1]
-    if len(sys.argv) >= 3:
-        out_path = sys.argv[2]
+        if len(sys.argv) >= 3:
+            out_path = sys.argv[2]
+    else:
+        root = tk.Tk()
+        root.withdraw()
+        messagebox.showinfo('Choose image', 'Please select an image to run face detection on.')
+        filetypes = [('Image files', '*.png;*.jpg;*.jpeg;*.bmp'), ('All files', '*.*')]
+        img_path = filedialog.askopenfilename(title='Select image', filetypes=filetypes)
+        root.destroy()
+
+    if not img_path:
+        print('No image selected. Exiting.')
+        sys.exit(0)
 
     count = detect_faces(img_path, out_path)
-    print(f"Detected {count} face(s) in '{img_path}'")
+    # show result in a small dialog as well as print
+    try:
+        root = tk.Tk()
+        root.withdraw()
+        messagebox.showinfo('Result', f"Detected {count} face(s) in '{img_path}'")
+        root.destroy()
+    except Exception:
+        # if tkinter fails for any reason, just print
+        print(f"Detected {count} face(s) in '{img_path}'")
