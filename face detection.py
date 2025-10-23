@@ -4,6 +4,9 @@ import os
 import numpy as np
 import tkinter as tk
 from tkinter import filedialog
+from tkinter import messagebox
+import urllib.request
+import shutil
 
 
 MODEL_MEAN_VALUES = (78.4263377603, 87.7689143744, 114.895847746)
@@ -78,6 +81,67 @@ def load_age_gender_models(model_dir):
     return age_net, gender_net
 
 
+AGE_MODEL_URLS = {
+    'age_deploy.prototxt': [
+        'https://raw.githubusercontent.com/spmallick/learnopencv/main/AgeGender/AgeGenderModels/age_deploy.prototxt',
+        'https://raw.githubusercontent.com/spmallick/learnopencv/master/AgeGender/AgeGenderModels/age_deploy.prototxt',
+    ],
+    'age_net.caffemodel': [
+        'https://raw.githubusercontent.com/spmallick/learnopencv/main/AgeGender/AgeGenderModels/age_net.caffemodel',
+        'https://raw.githubusercontent.com/spmallick/learnopencv/master/AgeGender/AgeGenderModels/age_net.caffemodel',
+    ],
+}
+
+GENDER_MODEL_URLS = {
+    'gender_deploy.prototxt': [
+        'https://raw.githubusercontent.com/spmallick/learnopencv/main/AgeGender/AgeGenderModels/gender_deploy.prototxt',
+        'https://raw.githubusercontent.com/spmallick/learnopencv/master/AgeGender/AgeGenderModels/gender_deploy.prototxt',
+    ],
+    'gender_net.caffemodel': [
+        'https://raw.githubusercontent.com/spmallick/learnopencv/main/AgeGender/AgeGenderModels/gender_net.caffemodel',
+        'https://raw.githubusercontent.com/spmallick/learnopencv/master/AgeGender/AgeGenderModels/gender_net.caffemodel',
+    ],
+}
+
+
+def download_file(url, dest_path):
+    tmp_path = dest_path + '.tmp'
+    with urllib.request.urlopen(url) as response, open(tmp_path, 'wb') as out_file:
+        shutil.copyfileobj(response, out_file)
+    os.replace(tmp_path, dest_path)
+
+
+def download_age_gender_models(model_dir, which='both'):
+    os.makedirs(model_dir, exist_ok=True)
+    results = []
+    def ensure(files_dict):
+        for name, urls in files_dict.items():
+            dest = os.path.join(model_dir, name)
+            if not os.path.exists(dest):
+                success = False
+                for url in urls:
+                    try:
+                        print(f'Downloading {name} ...')
+                        download_file(url, dest)
+                        print(f'Downloaded {name}')
+                        results.append(True)
+                        success = True
+                        break
+                    except Exception as e:
+                        print(f'Failed to download {name} from {url}: {e}')
+                if not success:
+                    results.append(False)
+            else:
+                results.append(True)
+
+    if which in ('age', 'both'):
+        ensure(AGE_MODEL_URLS)
+    if which in ('gender', 'both'):
+        ensure(GENDER_MODEL_URLS)
+
+    return all(results) if results else False
+
+
 def classify_age_gender(face_roi_bgr, age_net, gender_net):
     # Prepare blob for age/gender networks (Caffe, BGR mean values)
     blob = cv2.dnn.blobFromImage(face_roi_bgr, scalefactor=1.0, size=(227, 227),
@@ -114,6 +178,26 @@ def age_bucket_to_group(age_bucket):
     except Exception:
         upper = 0
     return 'Young' if upper <= 32 else 'Old'
+
+
+def age_bucket_to_range(age_bucket):
+    # Convert '(25-32)' -> (25, 32); returns (None, None) on failure
+    if not age_bucket:
+        return (None, None)
+    digits = ''.join(ch if ch.isdigit() else ' ' for ch in age_bucket).split()
+    if len(digits) >= 2:
+        try:
+            return int(digits[0]), int(digits[1])
+        except Exception:
+            return (None, None)
+    return (None, None)
+
+
+def age_bucket_midpoint(age_bucket):
+    lo, hi = age_bucket_to_range(age_bucket)
+    if lo is None or hi is None:
+        return None
+    return int(round((lo + hi) / 2))
 
 
 def draw_label(img, x, y, w, h, color, text):
@@ -153,12 +237,19 @@ def annotate_and_draw(img, faces, age_net, gender_net, palette):
                             male_count += 1
                         elif g_label == 'Female':
                             female_count += 1
-                    age_group = age_bucket_to_group(a_bucket) if a_bucket else None
-                    if age_group:
-                        parts.append(age_group)
+                    # Prefer explicit age bucket; add approx age in parentheses
+                    if a_bucket:
+                        lo, hi = age_bucket_to_range(a_bucket)
+                        if lo is not None and hi is not None:
+                            parts.append(f"Age {lo}-{hi}")
+                        else:
+                            # fallback to group
+                            age_group = age_bucket_to_group(a_bucket)
+                            if age_group:
+                                parts.append(age_group)
                     label_text = ', '.join(parts) if parts else label_text
         except Exception:
-            # Classification failure shouldn't break drawing
+            # Classification 
             pass
 
         draw_label(img, x, y, w, h, color, label_text)
@@ -224,6 +315,15 @@ def main():
     dnn_face_net = load_face_detector(model_dir)
     age_net, gender_net = load_age_gender_models(model_dir)
 
+    # Support CLI download flags for models
+    if '--download-age' in sys.argv or '--download-models' in sys.argv:
+        ok = download_age_gender_models(model_dir, which='age' if '--download-age' in sys.argv else 'both')
+        if ok:
+            print('Download complete.')
+        else:
+            print('Download finished with some errors. Check logs above.')
+        return
+
     # If a path was provided via CLI, process image directly
     if len(sys.argv) > 1:
         image_path = sys.argv[1]
@@ -233,7 +333,7 @@ def main():
     # GUI with two buttons: Photo and Video
     root = tk.Tk()
     root.title('Choose Mode')
-    root.geometry('280x120')
+    root.geometry('320x160')
 
     def on_photo():
         filetypes = [
@@ -251,10 +351,20 @@ def main():
         root.destroy()
         process_video(dnn_face_net, age_net, gender_net, cam_index=0)
 
-    btn_photo = tk.Button(root, text='Photo', width=12, command=on_photo)
-    btn_video = tk.Button(root, text='Video', width=12, command=on_video)
-    btn_photo.pack(pady=10)
-    btn_video.pack(pady=5)
+    def on_download_models():
+        model_dir = os.path.join(os.path.dirname(__file__), 'models')
+        ok = download_age_gender_models(model_dir, which='both')
+        if ok:
+            messagebox.showinfo('Models', 'Age/Gender models downloaded successfully.')
+        else:
+            messagebox.showwarning('Models', 'Some model files failed to download. Check the console for details.')
+
+    btn_photo = tk.Button(root, text='Photo', width=18, command=on_photo)
+    btn_video = tk.Button(root, text='Video', width=18, command=on_video)
+    btn_download = tk.Button(root, text='Download Age/Gender Models', width=24, command=on_download_models)
+    btn_photo.pack(pady=6)
+    btn_video.pack(pady=6)
+    btn_download.pack(pady=6)
 
     root.mainloop()
 
