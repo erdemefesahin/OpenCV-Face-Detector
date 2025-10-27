@@ -4,9 +4,21 @@ import os
 import numpy as np
 import tkinter as tk
 from tkinter import filedialog
-from tkinter import messagebox
-import urllib.request
-import shutil
+
+"""
+Optional dependency: DeepFace for age/gender with auto-downloaded weights.
+If not installed, the script falls back to Caffe age/gender models when available.
+"""
+try:
+    from deepface import DeepFace  # type: ignore
+    _HAS_DEEPFACE = True
+except Exception:
+    DeepFace = None
+    _HAS_DEEPFACE = False
+
+# One-time console notices for DeepFace downloads/errors
+_DF_NOTICE_SHOWN = False
+_DF_FAIL_SHOWN = False
 
 
 MODEL_MEAN_VALUES = (78.4263377603, 87.7689143744, 114.895847746)
@@ -66,7 +78,9 @@ def load_age_gender_models(model_dir):
         if os.path.exists(age_proto) and os.path.exists(age_model):
             age_net = cv2.dnn.readNetFromCaffe(age_proto, age_model)
         else:
-            print("Age model files not found in 'models/'. Age labels will be skipped.")
+            # Suppress noisy warning if DeepFace is available (it will provide age)
+            if not _HAS_DEEPFACE:
+                print("Age model files not found in 'models/'. Age labels will be skipped.")
     except Exception as e:
         print('Failed to load age model:', e)
 
@@ -74,72 +88,15 @@ def load_age_gender_models(model_dir):
         if os.path.exists(gender_proto) and os.path.exists(gender_model):
             gender_net = cv2.dnn.readNetFromCaffe(gender_proto, gender_model)
         else:
-            print("Gender model files not found in 'models/'. Gender labels will be skipped.")
+            if not _HAS_DEEPFACE:
+                print("Gender model files not found in 'models/'. Gender labels will be skipped.")
     except Exception as e:
         print('Failed to load gender model:', e)
 
     return age_net, gender_net
 
 
-AGE_MODEL_URLS = {
-    'age_deploy.prototxt': [
-        'https://raw.githubusercontent.com/spmallick/learnopencv/main/AgeGender/AgeGenderModels/age_deploy.prototxt',
-        'https://raw.githubusercontent.com/spmallick/learnopencv/master/AgeGender/AgeGenderModels/age_deploy.prototxt',
-    ],
-    'age_net.caffemodel': [
-        'https://raw.githubusercontent.com/spmallick/learnopencv/main/AgeGender/AgeGenderModels/age_net.caffemodel',
-        'https://raw.githubusercontent.com/spmallick/learnopencv/master/AgeGender/AgeGenderModels/age_net.caffemodel',
-    ],
-}
-
-GENDER_MODEL_URLS = {
-    'gender_deploy.prototxt': [
-        'https://raw.githubusercontent.com/spmallick/learnopencv/main/AgeGender/AgeGenderModels/gender_deploy.prototxt',
-        'https://raw.githubusercontent.com/spmallick/learnopencv/master/AgeGender/AgeGenderModels/gender_deploy.prototxt',
-    ],
-    'gender_net.caffemodel': [
-        'https://raw.githubusercontent.com/spmallick/learnopencv/main/AgeGender/AgeGenderModels/gender_net.caffemodel',
-        'https://raw.githubusercontent.com/spmallick/learnopencv/master/AgeGender/AgeGenderModels/gender_net.caffemodel',
-    ],
-}
-
-
-def download_file(url, dest_path):
-    tmp_path = dest_path + '.tmp'
-    with urllib.request.urlopen(url) as response, open(tmp_path, 'wb') as out_file:
-        shutil.copyfileobj(response, out_file)
-    os.replace(tmp_path, dest_path)
-
-
-def download_age_gender_models(model_dir, which='both'):
-    os.makedirs(model_dir, exist_ok=True)
-    results = []
-    def ensure(files_dict):
-        for name, urls in files_dict.items():
-            dest = os.path.join(model_dir, name)
-            if not os.path.exists(dest):
-                success = False
-                for url in urls:
-                    try:
-                        print(f'Downloading {name} ...')
-                        download_file(url, dest)
-                        print(f'Downloaded {name}')
-                        results.append(True)
-                        success = True
-                        break
-                    except Exception as e:
-                        print(f'Failed to download {name} from {url}: {e}')
-                if not success:
-                    results.append(False)
-            else:
-                results.append(True)
-
-    if which in ('age', 'both'):
-        ensure(AGE_MODEL_URLS)
-    if which in ('gender', 'both'):
-        ensure(GENDER_MODEL_URLS)
-
-    return all(results) if results else False
+# Removed URL-based downloader since public links are unreliable
 
 
 def classify_age_gender(face_roi_bgr, age_net, gender_net):
@@ -166,6 +123,48 @@ def classify_age_gender(face_roi_bgr, age_net, gender_net):
         age_conf = float(age_preds[a_idx])
 
     return gender_label, gender_conf, age_bucket, age_conf
+
+
+def classify_age_gender_deepface(face_roi_bgr):
+    """Classify age and gender using DeepFace if available.
+    Returns (gender_label, age_int) or (None, None) if unavailable.
+    """
+    if not _HAS_DEEPFACE or face_roi_bgr is None or face_roi_bgr.size == 0:
+        return None, None
+    try:
+        global _DF_NOTICE_SHOWN, _DF_FAIL_SHOWN
+        if not _DF_NOTICE_SHOWN:
+            print("DeepFace: initializing age/gender (first run may download models; please wait)...")
+            _DF_NOTICE_SHOWN = True
+        roi_rgb = cv2.cvtColor(face_roi_bgr, cv2.COLOR_BGR2RGB)
+        res = DeepFace.analyze(roi_rgb, actions=['age', 'gender'], enforce_detection=False, prog_bar=False)
+        if isinstance(res, list) and len(res) > 0:
+            res = res[0]
+        age_val = None
+        gender_label = None
+        if isinstance(res, dict):
+            # Age
+            if 'age' in res and res['age'] is not None:
+                try:
+                    age_val = int(round(float(res['age'])))
+                except Exception:
+                    age_val = None
+            # Gender label
+            dom = res.get('dominant_gender') or res.get('gender')
+            if isinstance(dom, str):
+                low = dom.lower()
+                if low in ('man', 'male'):
+                    gender_label = 'Male'
+                elif low in ('woman', 'female'):
+                    gender_label = 'Female'
+                else:
+                    gender_label = dom.title()
+        return gender_label, age_val
+    except Exception as e:
+        if not _DF_FAIL_SHOWN:
+            print(f"DeepFace: analyze failed, falling back if available. Details: {e}")
+            _DF_FAIL_SHOWN = True
+        return None, None
 
 
 def age_bucket_to_group(age_bucket):
@@ -223,33 +222,46 @@ def annotate_and_draw(img, faces, age_net, gender_net, palette):
 
         label_text = 'Face'
         try:
-            if age_net is not None or gender_net is not None:
-                x1, y1 = max(0, x), max(0, y)
-                x2, y2 = min(img.shape[1], x + w), min(img.shape[0], y + h)
-                roi = img[y1:y2, x1:x2]
-                if roi.size != 0:
-                    roi_resized = cv2.resize(roi, (227, 227))
-                    g_label, g_conf, a_bucket, a_conf = classify_age_gender(roi_resized, age_net, gender_net)
-                    parts = []
-                    if g_label:
-                        parts.append(g_label)
-                        if g_label == 'Male':
-                            male_count += 1
-                        elif g_label == 'Female':
-                            female_count += 1
-                    # Prefer explicit age bucket; add approx age in parentheses
-                    if a_bucket:
-                        lo, hi = age_bucket_to_range(a_bucket)
-                        if lo is not None and hi is not None:
-                            parts.append(f"Age {lo}-{hi}")
-                        else:
-                            # fallback to group
-                            age_group = age_bucket_to_group(a_bucket)
-                            if age_group:
-                                parts.append(age_group)
-                    label_text = ', '.join(parts) if parts else label_text
+            # Crop ROI once
+            x1, y1 = max(0, x), max(0, y)
+            x2, y2 = min(img.shape[1], x + w), min(img.shape[0], y + h)
+            roi = img[y1:y2, x1:x2]
+
+            parts = []
+            # 1) Try DeepFace (auto-downloads models)
+            g_df, age_df = classify_age_gender_deepface(roi)
+            if g_df:
+                parts.append(g_df)
+                if g_df == 'Male':
+                    male_count += 1
+                elif g_df == 'Female':
+                    female_count += 1
+            if age_df is not None:
+                parts.append(f'Age {age_df}')
+
+            # 2) Fallback to Caffe age/gender if nothing added
+            if not parts and (age_net is not None or gender_net is not None) and roi.size != 0:
+                roi_resized = cv2.resize(roi, (227, 227))
+                g_label, g_conf, a_bucket, a_conf = classify_age_gender(roi_resized, age_net, gender_net)
+                if g_label:
+                    parts.append(g_label)
+                    if g_label == 'Male':
+                        male_count += 1
+                    elif g_label == 'Female':
+                        female_count += 1
+                if a_bucket:
+                    lo, hi = age_bucket_to_range(a_bucket)
+                    if lo is not None and hi is not None:
+                        parts.append(f'Age {lo}-{hi}')
+                    else:
+                        age_group = age_bucket_to_group(a_bucket)
+                        if age_group:
+                            parts.append(age_group)
+
+            if parts:
+                label_text = ', '.join(parts)
         except Exception:
-            # Classification 
+            # Classification failure shouldn't break drawing
             pass
 
         draw_label(img, x, y, w, h, color, label_text)
@@ -315,14 +327,12 @@ def main():
     dnn_face_net = load_face_detector(model_dir)
     age_net, gender_net = load_age_gender_models(model_dir)
 
-    # Support CLI download flags for models
-    if '--download-age' in sys.argv or '--download-models' in sys.argv:
-        ok = download_age_gender_models(model_dir, which='age' if '--download-age' in sys.argv else 'both')
-        if ok:
-            print('Download complete.')
-        else:
-            print('Download finished with some errors. Check logs above.')
-        return
+    if _HAS_DEEPFACE:
+        print("Age/Gender: Using DeepFace (models auto-download on first use)")
+    else:
+        # If DeepFace not installed and no Caffe models loaded, warn user.
+        if age_net is None and gender_net is None:
+            print("Tip: Install DeepFace for automatic age/gender models: pip install deepface")
 
     # If a path was provided via CLI, process image directly
     if len(sys.argv) > 1:
@@ -333,7 +343,7 @@ def main():
     # GUI with two buttons: Photo and Video
     root = tk.Tk()
     root.title('Choose Mode')
-    root.geometry('320x160')
+    root.geometry('280x120')
 
     def on_photo():
         filetypes = [
@@ -351,20 +361,10 @@ def main():
         root.destroy()
         process_video(dnn_face_net, age_net, gender_net, cam_index=0)
 
-    def on_download_models():
-        model_dir = os.path.join(os.path.dirname(__file__), 'models')
-        ok = download_age_gender_models(model_dir, which='both')
-        if ok:
-            messagebox.showinfo('Models', 'Age/Gender models downloaded successfully.')
-        else:
-            messagebox.showwarning('Models', 'Some model files failed to download. Check the console for details.')
-
     btn_photo = tk.Button(root, text='Photo', width=18, command=on_photo)
     btn_video = tk.Button(root, text='Video', width=18, command=on_video)
-    btn_download = tk.Button(root, text='Download Age/Gender Models', width=24, command=on_download_models)
-    btn_photo.pack(pady=6)
+    btn_photo.pack(pady=8)
     btn_video.pack(pady=6)
-    btn_download.pack(pady=6)
 
     root.mainloop()
 
