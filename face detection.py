@@ -10,13 +10,20 @@ Optional dependency: DeepFace for age/gender with auto-downloaded weights.
 If not installed, the script falls back to Caffe age/gender models when available.
 """
 try:
-    from deepface import DeepFace  # type: ignore
+    from deepface import DeepFace  
     _HAS_DEEPFACE = True
 except Exception:
     DeepFace = None
     _HAS_DEEPFACE = False
 
-# One-time console notices for DeepFace downloads/errors
+# Custom CNN Age Classifier
+try:
+    from predict_age import predict_age
+    _HAS_CUSTOM_AGE_MODEL = True
+except Exception as e:
+    predict_age = None
+    _HAS_CUSTOM_AGE_MODEL = False
+
 _DF_NOTICE_SHOWN = False
 _DF_FAIL_SHOWN = False
 
@@ -78,7 +85,7 @@ def load_age_gender_models(model_dir):
         if os.path.exists(age_proto) and os.path.exists(age_model):
             age_net = cv2.dnn.readNetFromCaffe(age_proto, age_model)
         else:
-            # Suppress noisy warning if DeepFace is available (it will provide age)
+            
             if not _HAS_DEEPFACE:
                 print("Age model files not found in 'models/'. Age labels will be skipped.")
     except Exception as e:
@@ -96,11 +103,11 @@ def load_age_gender_models(model_dir):
     return age_net, gender_net
 
 
-# Removed URL-based downloader since public links are unreliable
+
 
 
 def classify_age_gender(face_roi_bgr, age_net, gender_net):
-    # Prepare blob for age/gender networks (Caffe, BGR mean values)
+    
     blob = cv2.dnn.blobFromImage(face_roi_bgr, scalefactor=1.0, size=(227, 227),
                                  mean=MODEL_MEAN_VALUES, swapRB=False, crop=False)
     gender_label = None
@@ -170,7 +177,7 @@ def classify_age_gender_deepface(face_roi_bgr):
 def age_bucket_to_group(age_bucket):
     if not age_bucket:
         return None
-    # Parse the upper bound from strings like '(25-32)'
+    
     digits = ''.join(ch if ch.isdigit() else ' ' for ch in age_bucket).split()
     try:
         upper = int(digits[-1]) if digits else 0
@@ -180,7 +187,7 @@ def age_bucket_to_group(age_bucket):
 
 
 def age_bucket_to_range(age_bucket):
-    # Convert '(25-32)' -> (25, 32); returns (None, None) on failure
+    
     if not age_bucket:
         return (None, None)
     digits = ''.join(ch if ch.isdigit() else ' ' for ch in age_bucket).split()
@@ -200,7 +207,7 @@ def age_bucket_midpoint(age_bucket):
 
 
 def draw_label(img, x, y, w, h, color, text):
-    # Put text above the bounding box with a filled background for readability
+   
     font = cv2.FONT_HERSHEY_SIMPLEX
     scale = 0.5
     thickness = 1
@@ -222,24 +229,44 @@ def annotate_and_draw(img, faces, age_net, gender_net, palette):
 
         label_text = 'Face'
         try:
-            # Crop ROI once
+           
             x1, y1 = max(0, x), max(0, y)
             x2, y2 = min(img.shape[1], x + w), min(img.shape[0], y + h)
             roi = img[y1:y2, x1:x2]
 
             parts = []
-            # 1) Try DeepFace (auto-downloads models)
-            g_df, age_df = classify_age_gender_deepface(roi)
-            if g_df:
-                parts.append(g_df)
-                if g_df == 'Male':
-                    male_count += 1
-                elif g_df == 'Female':
-                    female_count += 1
-            if age_df is not None:
-                parts.append(f'Age {age_df}')
+            
+            # Priority 1: Custom CNN Age Model
+            if _HAS_CUSTOM_AGE_MODEL and roi.size != 0:
+                try:
+                    age_group = predict_age(roi)
+                    if age_group:
+                        parts.append(f'Age {age_group}')
+                except Exception as e:
+                    pass  # Fall through to other methods
+            
+            # Priority 2: DeepFace for gender (and age if custom model failed)
+            if not parts:  # If custom model didn't work, try DeepFace
+                g_df, age_df = classify_age_gender_deepface(roi)
+                if g_df:
+                    parts.append(g_df)
+                    if g_df == 'Male':
+                        male_count += 1
+                    elif g_df == 'Female':
+                        female_count += 1
+                if age_df is not None:
+                    parts.append(f'Age {age_df}')
+            else:
+                # Custom model worked for age, still try DeepFace for gender only
+                g_df, _ = classify_age_gender_deepface(roi)
+                if g_df:
+                    parts.insert(0, g_df)  # Add gender at the beginning
+                    if g_df == 'Male':
+                        male_count += 1
+                    elif g_df == 'Female':
+                        female_count += 1
 
-            # 2) Fallback to Caffe age/gender if nothing added
+            # Priority 3: Fallback to Caffe models
             if not parts and (age_net is not None or gender_net is not None) and roi.size != 0:
                 roi_resized = cv2.resize(roi, (227, 227))
                 g_label, g_conf, a_bucket, a_conf = classify_age_gender(roi_resized, age_net, gender_net)
@@ -261,7 +288,7 @@ def annotate_and_draw(img, faces, age_net, gender_net, palette):
             if parts:
                 label_text = ', '.join(parts)
         except Exception:
-            # Classification failure shouldn't break drawing
+            
             pass
 
         draw_label(img, x, y, w, h, color, label_text)
@@ -322,25 +349,35 @@ def process_video(dnn_face_net, age_net, gender_net, cam_index=0):
 
 
 def main():
-    # Load models once
+    
     model_dir = os.path.join(os.path.dirname(__file__), 'models')
     dnn_face_net = load_face_detector(model_dir)
     age_net, gender_net = load_age_gender_models(model_dir)
 
-    if _HAS_DEEPFACE:
-        print("Age/Gender: Using DeepFace (models auto-download on first use)")
+    # Print available age/gender detection methods
+    if _HAS_CUSTOM_AGE_MODEL:
+        print("✅ Custom CNN Age Model: Loaded (Priority)")
     else:
-        # If DeepFace not installed and no Caffe models loaded, warn user.
+        print("⚠️  Custom CNN Age Model: Not available")
+    
+    if _HAS_DEEPFACE:
+        print("✅ DeepFace: Available (for gender + fallback age)")
+    else:
         if age_net is None and gender_net is None:
-            print("Tip: Install DeepFace for automatic age/gender models: pip install deepface")
+            print("⚠️  DeepFace: Not installed (tip: pip install deepface)")
+    
+    if age_net or gender_net:
+        print("✅ Caffe Models: Available (fallback)")
+    else:
+        print("⚠️  Caffe Models: Not available")
 
-    # If a path was provided via CLI, process image directly
+    
     if len(sys.argv) > 1:
         image_path = sys.argv[1]
         process_image(image_path, dnn_face_net, age_net, gender_net)
         return
 
-    # GUI with two buttons: Photo and Video
+    
     root = tk.Tk()
     root.title('Choose Mode')
     root.geometry('280x120')
